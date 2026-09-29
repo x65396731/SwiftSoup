@@ -13,11 +13,16 @@ internal final class SourceBuffer {
     let bytes: [UInt8]
     @usableFromInline
     let storage: ByteStorage
+    // A moved node keeps its original source, even when its new owner uses a
+    // different parsing syntax. Validate reuse against this immutable provenance.
+    @usableFromInline
+    let parsedAsXml: Bool
     
     @usableFromInline
-    init(_ bytes: [UInt8]) {
+    init(_ bytes: [UInt8], parsedAsXml: Bool) {
         self.bytes = bytes
         self.storage = ByteStorage(array: bytes)
+        self.parsedAsXml = parsedAsXml
     }
 }
 
@@ -572,15 +577,16 @@ open class Document: Element {
 				try s.remove()
 
             } else if (syntax == OutputSettings.Syntax.xml) {
-                let node: Node = getChildNodes()[0]
+                let node = getChildNodes().first
 
                 if let decl = (node as? XmlDeclaration) {
 
                     if (decl.name()=="xml") {
                         try decl.attr("encoding".utf8Array, charset().displayName().utf8Array)
 
-                        _ = try  decl.attr("version".utf8Array)
-                        try decl.attr("version".utf8Array, "1.0".utf8Array)
+                        if try decl.attr("version".utf8Array).isEmpty {
+                            try decl.attr("version".utf8Array, "1.0".utf8Array)
+                        }
                     } else {
                         try Validate.notNull(obj: baseUri)
                         let decl = XmlDeclaration("xml".utf8Array, baseUri!, false)
@@ -722,12 +728,18 @@ open class Document: Element {
 
     @usableFromInline
     internal func patchedOuterHtmlUTF8() throws -> [UInt8]? {
-        guard !_outputSettings.prettyPrint(),
+        guard _outputSettings.canReuseSource(parsedAsXml: parsedAsXml),
               let source = sourceBuffer?.bytes else {
             return nil
         }
 
+        // Synthetic fragment containers have no replaceable source range. Their
+        // child edits cannot be represented by splicing ranges from the input.
+        guard currentDirtySourceRoots().allSatisfy({
+            $0.sourceRangeIsComplete && $0.sourceRange != nil
+        }) else { return nil }
         let patches = try sourcePatches()
+        if patches.isEmpty, sourceRangeDirty { return nil }
         if patches.isEmpty {
             return source
         }
@@ -782,32 +794,36 @@ open class Document: Element {
 	}
 
     @inline(__always)
-	public override func copy(parent: Node?) -> Node {
+    public override func copy(parent: Node?) -> Node {
 		let clone = Document(_location)
 		return copy(clone: clone, parent: parent)
 	}
 
+    public override func copy(clone: Node) -> Node {
+        copyDocumentState(to: clone as! Document)
+        return super.copy(clone: clone)
+    }
+
     override func copyForDeepClone(parent: Node?) -> Node {
         let clone = Document(_location)
-        clone._outputSettings = _outputSettings.copy() as! OutputSettings
-        clone._quirksMode = _quirksMode
-        clone.updateMetaCharset = updateMetaCharset
-        clone.sourceBuffer = nil
-        clone.parsedAsXml = parsedAsXml
-        clone.dirtySourceRoots.removeAll(keepingCapacity: false)
+        copyDocumentState(to: clone)
         return copy(clone: clone, parent: parent, copyChildren: false, rebuildIndexes: false)
     }
 
     @inline(__always)
     public override func copy(clone: Node, parent: Node?) -> Node {
         let clone = clone as! Document
+        copyDocumentState(to: clone)
+        return super.copy(clone: clone, parent: parent)
+    }
+
+    private func copyDocumentState(to clone: Document) {
         clone._outputSettings = _outputSettings.copy() as! OutputSettings
         clone._quirksMode = _quirksMode
         clone.updateMetaCharset = updateMetaCharset
         clone.sourceBuffer = nil
         clone.parsedAsXml = parsedAsXml
         clone.dirtySourceRoots.removeAll(keepingCapacity: false)
-        return super.copy(clone: clone, parent: parent)
     }
 
 }
@@ -828,6 +844,14 @@ public class OutputSettings: NSCopying {
     private var _syntax = Syntax.html
 
     public init() {}
+
+    /// Source slices preserve their original entity spelling. Only the default
+    /// encoding/escape policy can reuse them without bypassing output settings.
+    @usableFromInline
+    internal func canReuseSource(parsedAsXml: Bool) -> Bool {
+        !_prettyPrint && _encoder == .utf8 && _escapeMode == .base
+            && parsedAsXml == (_syntax == .xml)
+    }
 
     /**
      Get the document's current HTML escape mode: `e`, which provides a limited set of named HTML

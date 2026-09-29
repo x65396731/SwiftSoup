@@ -1088,23 +1088,15 @@ open class Node: Equatable, Hashable {
               let range = sourceRange,
               range.isValid,
               let doc = ownerDocument(),
-              let source = sourceBuffer?.bytes ?? doc.sourceBuffer?.bytes
+              let source = sourceBuffer ?? doc.sourceBuffer
         else {
             return nil
         }
-        let syntax = out.syntax()
-        if syntax == .xml && !doc.parsedAsXml {
+        if !out.canReuseSource(parsedAsXml: source.parsedAsXml)
+            || range.end > source.bytes.count {
             return nil
         }
-        if syntax == .html || syntax == .xml {
-            // ok
-        } else {
-            return nil
-        }
-        if range.end > source.count {
-            return nil
-        }
-        return source[range.start..<range.end]
+        return source.bytes[range.start..<range.end]
     }
 
     @inline(__always)
@@ -1230,6 +1222,10 @@ open class Node: Equatable, Hashable {
         // BFS clone using index-based queue, preserving original nodes to avoid extra array copies.
         var queue: [(Node, Node)] = [(self, thisClone)]
         queue.reserveCapacity(8)
+        var formCopies: [(FormElement, FormElement)] = []
+        if let form = self as? FormElement, let formClone = thisClone as? FormElement {
+            formCopies.append((form, formClone))
+        }
         var idx = 0
         while idx < queue.count {
             let (originalParent, cloneParent) = queue[idx]
@@ -1242,6 +1238,9 @@ open class Node: Equatable, Hashable {
                 for child in originalChildren {
                     let childClone = child.copyForDeepClone(parent: cloneParent)
                     newChildren.append(childClone)
+                    if let form = child as? FormElement, let formClone = childClone as? FormElement {
+                        formCopies.append((form, formClone))
+                    }
                     if child.hasChildNodes() {
                         queue.append((child, childClone))
                     }
@@ -1252,6 +1251,9 @@ open class Node: Equatable, Hashable {
             }
         }
         
+        if !formCopies.isEmpty {
+            FormElement.rebindClonedControlAssociations(formCopies, clonedParents: queue)
+        }
         return thisClone
     }
     
